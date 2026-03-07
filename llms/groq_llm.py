@@ -1,21 +1,18 @@
 """
 Groq LLM interface for TopoRAG.
 
-Groq provides FREE API access to fast LLM inference:
-- llama-3.3-70b-versatile (recommended)
-- llama-3.1-8b-instant (faster)
-- mixtral-8x7b-32768
-- gemma2-9b-it
+Groq provides fast, free-tier inference for llama-3.1-8b-instant and similar models.
+Used for speculative query generation (never for evaluation).
 
-Get free API key at: https://console.groq.com/
-
-This is a cost-effective alternative to OpenAI for development/testing.
+Free tier limits (as of 2025):
+  llama-3.1-8b-instant  : 6000 req/day, 30 req/min
+  llama-3.3-70b-versatile: 1000 req/day, 30 req/min
 """
 
 import os
 import time
 import logging
-from typing import List, Dict, Optional
+from typing import Optional, List, Dict
 
 from .base import BaseLLM
 
@@ -24,84 +21,61 @@ logger = logging.getLogger(__name__)
 
 class GroqLLM(BaseLLM):
     """
-    Groq LLM interface.
-
-    Groq offers free API access with rate limits.
-    Excellent for development and testing TopoRAG.
+    Groq API client.
 
     Args:
-        model_name: Model to use (default: llama-3.1-70b-versatile)
+        model_name: Groq model (default: llama-3.1-8b-instant — free, fast, good quality)
         temperature: Sampling temperature
-        max_tokens: Maximum tokens to generate
-        retry: Number of retries on failure
-        api_key: Groq API key (or set GROQ_API_KEY env var)
-
-    Available models:
-        - llama-3.3-70b-versatile: Best quality (recommended)
-        - llama-3.1-8b-instant: Faster, good for testing
-        - mixtral-8x7b-32768: Good balance
-        - gemma2-9b-it: Google's model
+        max_tokens: Max tokens in response
+        retry: Number of retries on rate-limit / transient errors
+        api_key: Groq API key (defaults to GROQ_API_KEY env var)
     """
 
-    AVAILABLE_MODELS = [
-        "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
-        "llama-3.2-90b-vision-preview",
-        "mixtral-8x7b-32768",
-        "gemma2-9b-it",
-    ]
+    RATE_LIMIT_PAUSE = 2.5  # seconds between requests (safe for 30 req/min limit)
 
     def __init__(
         self,
-        model_name: str = "llama-3.3-70b-versatile",
-        temperature: float = 0.0,
-        max_tokens: int = 1024,
-        retry: int = 3,
+        model_name: str = "llama-3.1-8b-instant",
+        temperature: float = 0.3,
+        max_tokens: int = 256,
+        retry: int = 4,
         api_key: Optional[str] = None,
     ):
         super().__init__(model_name, temperature, max_tokens, retry)
 
-        # Get API key
         self.api_key = api_key or os.environ.get("GROQ_API_KEY")
         if not self.api_key:
             raise ValueError(
-                "Groq API key required. Get a FREE key at https://console.groq.com/ "
-                "and set GROQ_API_KEY environment variable or pass api_key parameter."
+                "Groq API key required. Set GROQ_API_KEY in .env or pass api_key=..."
             )
 
-        # Import Groq client
         try:
             from groq import Groq
-            self.client = Groq(api_key=self.api_key)
         except ImportError:
-            raise ImportError(
-                "Groq package not installed. Install with: pip install groq"
-            )
+            raise ImportError("Run: pip install groq")
 
-    def generate(
-        self,
-        prompt: str,
-        system_prompt: Optional[str] = None,
-    ) -> str:
-        """Generate text from a prompt."""
-        messages = []
+        self.client = Groq(api_key=self.api_key)
+        self._last_call = 0.0
 
+    def _wait_rate_limit(self):
+        """Ensure minimum gap between API calls."""
+        elapsed = time.time() - self._last_call
+        if elapsed < self.RATE_LIMIT_PAUSE:
+            time.sleep(self.RATE_LIMIT_PAUSE - elapsed)
+        self._last_call = time.time()
+
+    def generate(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+        messages: List[Dict[str, str]] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
-
         messages.append({"role": "user", "content": prompt})
-
         return self.generate_with_messages(messages)
 
-    def generate_with_messages(
-        self,
-        messages: List[Dict[str, str]],
-    ) -> str:
-        """Generate text from messages."""
+    def generate_with_messages(self, messages: List[Dict[str, str]]) -> str:
         last_error = None
-
         for attempt in range(self.retry + 1):
             try:
+                self._wait_rate_limit()
                 response = self.client.chat.completions.create(
                     model=self.model_name,
                     messages=messages,
@@ -109,77 +83,10 @@ class GroqLLM(BaseLLM):
                     max_tokens=self.max_tokens,
                 )
                 return response.choices[0].message.content.strip()
-
             except Exception as e:
                 last_error = e
-                error_str = str(e).lower()
-
-                # Handle rate limiting
-                if "rate_limit" in error_str or "429" in error_str:
-                    wait_time = min(60, 10 * (attempt + 1))
-                    logger.warning(f"Rate limited. Waiting {wait_time}s...")
-                    time.sleep(wait_time)
-                else:
-                    logger.warning(f"Groq API error (attempt {attempt + 1}): {e}")
-                    if attempt < self.retry:
-                        time.sleep(2 ** attempt)
+                wait = min(60, 5 * (attempt + 1))
+                logger.warning(f"Groq error (attempt {attempt + 1}/{self.retry + 1}): {e}. Waiting {wait}s...")
+                time.sleep(wait)
 
         raise RuntimeError(f"Groq API failed after {self.retry + 1} attempts: {last_error}")
-
-
-class GroqBatchLLM(GroqLLM):
-    """
-    Groq LLM with batching support for efficient query generation.
-
-    Handles rate limits by batching requests with delays.
-    """
-
-    def __init__(
-        self,
-        model_name: str = "llama-3.1-8b-instant",  # Faster model for batch
-        batch_delay: float = 1.0,  # Delay between requests (rate limit)
-        **kwargs,
-    ):
-        super().__init__(model_name=model_name, **kwargs)
-        self.batch_delay = batch_delay
-
-    def generate_batch(
-        self,
-        prompts: List[str],
-        system_prompt: Optional[str] = None,
-        show_progress: bool = True,
-    ) -> List[str]:
-        """
-        Generate responses for multiple prompts.
-
-        Args:
-            prompts: List of prompts
-            system_prompt: Shared system prompt
-            show_progress: Whether to show progress
-
-        Returns:
-            List of generated responses
-        """
-        responses = []
-
-        if show_progress:
-            try:
-                from tqdm import tqdm
-                iterator = tqdm(prompts, desc="Generating")
-            except ImportError:
-                iterator = prompts
-        else:
-            iterator = prompts
-
-        for prompt in iterator:
-            try:
-                response = self.generate(prompt, system_prompt=system_prompt)
-                responses.append(response)
-            except Exception as e:
-                logger.error(f"Failed to generate for prompt: {e}")
-                responses.append("")
-
-            # Rate limit delay
-            time.sleep(self.batch_delay)
-
-        return responses

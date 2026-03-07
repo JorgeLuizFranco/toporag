@@ -7,15 +7,19 @@ Provides static lifting transformations from graphs to higher-order structures:
 - KNNLifting: Graph → Hypergraph (via k-NN neighborhoods)
 """
 
-from .base import BaseLiftingTransform, LiftedTopology
+from .base import BaseLiftingTransform, LiftedTopology, Cell
 from .cycle import CycleLifting
 from .clique import CliqueLifting
 from .knn import KNNHypergraphLifting
 
+KNNLifting = KNNHypergraphLifting
+
 __all__ = [
     "BaseLiftingTransform",
     "LiftedTopology",
+    "Cell",
     "CycleLifting",
     "CliqueLifting",
     "KNNHypergraphLifting",
+    "KNNLifting",
 ]

@@ -90,3 +90,17 @@ coverage.xml
 
 # Linux
 *~
+
+# Virtual environments
+venv/
+
+# Environment variables
+.env
+
+# Cached queries / model checkpoints
+experiments/cache/
+*.pt
+*.pth
+
+# Claude
+.claude/

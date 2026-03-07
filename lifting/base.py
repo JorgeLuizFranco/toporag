@@ -57,6 +57,83 @@ class LiftedTopology:
     cells: List[Any] = field(default_factory=list)  # List of cell objects
     cell_to_nodes: Dict[int, List[int]] = field(default_factory=dict)  # cell_idx -> node indices
 
+    @property
+    def dimensions(self) -> List[int]:
+        """Return available dimensions in this topology."""
+        dims = [0]
+        if self.num_edges > 0: dims.append(1)
+        if self.num_2cells > 0: dims.append(2)
+        return dims
+
+    def get_cells(self, dimension: int) -> List[Any]:
+        """Get cells of a specific dimension."""
+        if dimension == 0:
+            return list(range(self.num_nodes))
+        
+        # Filter higher-order cells by dimension
+        ho_cells = self.get_all_higher_order_cells()
+        return [c for c in ho_cells if c.dimension == dimension]
+
+    def get_all_higher_order_cells(self) -> List[Any]:
+        """
+        Get all higher-order cells (dim > 0) in a format compatible with SpeculativeQueryGenerator.
+        """
+        from toporag.lifting.base import Cell
+        
+        higher_order_cells = []
+        
+        # incidence_1 columns are edges (1-cells)
+        if self.incidence_1 is not None:
+            num_edges = self.incidence_1.shape[1]
+            # Convert sparse incidence to find nodes for each edge
+            if self.incidence_1.is_sparse:
+                adj = self.incidence_1.coalesce()
+                indices = adj.indices()
+                for e_idx in range(num_edges):
+                    mask = indices[1] == e_idx
+                    nodes = set(indices[0][mask].tolist())
+                    if len(nodes) >= 2:
+                        higher_order_cells.append(Cell(
+                            chunk_indices=nodes,
+                            dimension=1,
+                            cell_id=e_idx
+                        ))
+            else:
+                for e_idx in range(num_edges):
+                    nodes = set(torch.where(self.incidence_1[:, e_idx] > 0)[0].tolist())
+                    if len(nodes) >= 2:
+                        higher_order_cells.append(Cell(
+                            chunk_indices=nodes,
+                            dimension=1,
+                            cell_id=e_idx
+                        ))
+        
+        # incidence_2 columns are 2-cells
+        if self.incidence_2 is not None:
+            num_2cells = self.incidence_2.shape[1]
+            # incidence_2 is (num_edges, num_2cells)
+            # We need to find nodes in each 2-cell via edges
+            B1 = self.incidence_1.to_dense() if self.incidence_1.is_sparse else self.incidence_1
+            B2 = self.incidence_2.to_dense() if self.incidence_2.is_sparse else self.incidence_2
+            
+            for c_idx in range(num_2cells):
+                # Find edges in this 2-cell
+                edge_indices = torch.where(B2[:, c_idx] > 0)[0]
+                # Find nodes in these edges
+                nodes = set()
+                for e_idx in edge_indices:
+                    e_nodes = torch.where(B1[:, e_idx] > 0)[0].tolist()
+                    nodes.update(e_nodes)
+                
+                if len(nodes) >= 3:
+                    higher_order_cells.append(Cell(
+                        chunk_indices=nodes,
+                        dimension=2,
+                        cell_id=num_edges + c_idx
+                    ))
+                    
+        return higher_order_cells
+
     def to(self, device: str) -> 'LiftedTopology':
         """Move all tensors to device."""
         def _to_device(t):
@@ -204,14 +281,10 @@ class BaseLiftingTransform(ABC):
     ) -> torch.Tensor:
         """
         Lift node features to higher-order cells.
-
-        Args:
-            node_features: (num_nodes, dim) tensor
-            incidence: (num_nodes, num_cells) incidence matrix
-
-        Returns:
-            (num_cells, dim) tensor of cell features
         """
+        device = node_features.device
+        incidence = incidence.to(device)
+        
         if self.feature_lifting == "projection_sum":
             # Sum of node features in each cell
             if incidence.is_sparse:
@@ -245,3 +318,12 @@ class BaseLiftingTransform(ABC):
         adj.fill_diagonal_(0)
 
         return adj.to_sparse_coo()
+
+
+@dataclass
+class Cell:
+    """A cell in a topological complex."""
+    chunk_indices: set
+    dimension: int
+    cell_id: int
+

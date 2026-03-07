@@ -1,26 +1,14 @@
-"""
-Base LLM interface for TopoRAG.
-"""
+import logging
+import sqlite3
+import hashlib
+from typing import Optional, List, Dict
+from pathlib import Path
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Union
-
-
-@dataclass
-class LLMResponse:
-    """Response from an LLM."""
-    content: str
-    model: str
-    usage: Optional[Dict[str, int]] = None  # tokens used
+logger = logging.getLogger(__name__)
 
 
-class BaseLLM(ABC):
-    """
-    Abstract base class for LLM interfaces.
-
-    All LLM implementations should inherit from this class.
-    """
+class BaseLLM:
+    """Base class for LLM interfaces."""
 
     def __init__(
         self,
@@ -34,39 +22,88 @@ class BaseLLM(ABC):
         self.max_tokens = max_tokens
         self.retry = retry
 
-    @abstractmethod
-    def generate(
-        self,
-        prompt: str,
-        system_prompt: Optional[str] = None,
-    ) -> str:
-        """
-        Generate text from a prompt.
+    def generate(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+        """Generate text from a prompt."""
+        raise NotImplementedError
 
-        Args:
-            prompt: User prompt
-            system_prompt: Optional system prompt
+    def generate_with_messages(self, messages: List[Dict[str, str]]) -> str:
+        """Generate text from messages."""
+        raise NotImplementedError
 
-        Returns:
-            Generated text
-        """
-        pass
 
-    @abstractmethod
-    def generate_with_messages(
-        self,
-        messages: List[Dict[str, str]],
-    ) -> str:
-        """
-        Generate text from a list of messages.
+class CachedLLM(BaseLLM):
+    """
+    Wrapper for any LLM that caches responses in SQLite.
+    
+    This saves money and time by not re-querying the API for known prompts.
+    """
 
-        Args:
-            messages: List of {"role": "...", "content": "..."} dicts
+    def __init__(self, llm: BaseLLM, cache_dir: str = ".cache"):
+        super().__init__(
+            llm.model_name, llm.temperature, llm.max_tokens, llm.retry
+        )
+        self.llm = llm
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Use model-specific DB file for physical separation
+        safe_name = "".join(c if c.isalnum() or c in ".-_" else "_" for c in self.model_name)
+        self.db_path = self.cache_dir / f"cache_{safe_name}.db"
+        
+        self._init_db()
 
-        Returns:
-            Generated text
-        """
-        pass
+    def _init_db(self):
+        """Initialize SQLite database."""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS cache (
+                id TEXT PRIMARY KEY,
+                prompt TEXT,
+                response TEXT,
+                model TEXT
+            )
+        ''')
+        conn.commit()
+        conn.close()
+
+    def _get_cache_key(self, prompt: str) -> str:
+        """Generate a unique key for the prompt and model config."""
+        content = f"{self.model_name}_{self.temperature}_{prompt}"
+        return hashlib.md5(content.encode()).hexdigest()
+
+    def generate(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+        """Check cache before generating."""
+        full_prompt = prompt
+        if system_prompt:
+            full_prompt = f"System: {system_prompt}\nUser: {prompt}"
+
+        key = self._get_cache_key(full_prompt)
+
+        # Check cache
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute("SELECT response FROM cache WHERE id=?", (key,))
+        result = c.fetchone()
+        conn.close()
+
+        if result:
+            return result[0]
+
+        # Generate fresh
+        response = self.llm.generate(prompt, system_prompt)
+
+        # Save to cache
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute(
+            "INSERT OR REPLACE INTO cache (id, prompt, response, model) VALUES (?, ?, ?, ?)",
+            (key, full_prompt, response, self.model_name)
+        )
+        conn.commit()
+        conn.close()
+
+        return response
 
     def generate_answer(
         self,

@@ -50,10 +50,10 @@ class GPSLayer(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # Layer norms
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        self.norm3 = nn.LayerNorm(hidden_dim)
+        # Use Identity instead of LayerNorm to preserve pre-trained feature scales
+        self.norm1 = nn.Identity()
+        self.norm2 = nn.Identity()
+        self.norm3 = nn.Identity()
 
         self.dropout = nn.Dropout(dropout)
 
@@ -132,6 +132,11 @@ class GPS(nn.Module):
 
         # Output projection
         self.output_proj = nn.Linear(hidden_channels, out_channels)
+        
+        # Initialize output projection to near-zero to preserve pre-trained features
+        with torch.no_grad():
+            self.output_proj.weight.fill_(0.0)
+            self.output_proj.bias.fill_(0.0)
 
     def forward(
         self,

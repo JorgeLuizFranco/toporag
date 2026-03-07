@@ -49,10 +49,10 @@ class TopoRAGConfig:
     similarity_threshold: float = 0.3
 
     # Lifting
-    lifting: str = "cycle"  # 'cycle', 'clique', 'knn'
+    lifting: str = "knn"  # 'cycle', 'clique', 'knn'
     max_cycle_length: int = 6
     max_clique_size: int = 4
-    knn_k: int = 5
+    knn_k: int = 10
 
     # GPS (Graph Transformer - like LP-RAG)
     use_gps: bool = True  # Process graph with GPS before TNN
@@ -60,21 +60,24 @@ class TopoRAGConfig:
     gps_heads: int = 4
 
     # TNN
-    tnn_type: str = "cwn"  # 'cwn', 'scn', 'hypergraph'
-    hidden_dim: int = 768  # Keep full embedding dimension to preserve quality
+    tnn_type: str = "hypergraph_gps"  # 'cwn', 'scn', 'hypergraph', 'hypergraph_attn', 'hypergraph_gps'
+    hidden_dim: int = 768  # Match embed_dim to avoid information loss
     num_tnn_layers: int = 2
     dropout: float = 0.1
     use_tnn: bool = True  # Set to False to skip TNN and use raw embeddings
     use_residual: bool = True  # Add residual connection to preserve embedding quality
 
     # Training
-    learning_rate: float = 1e-4
+    learning_rate: float = 5e-4
     num_epochs: int = 10
     batch_size: int = 32
     num_negative_samples: int = 5
 
     # Retrieval
     top_k: int = 5
+
+    # Debug
+    debug: bool = False
 
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -141,28 +144,39 @@ class TopoRAG(nn.Module):
             self.gps = None
 
         # Initialize TNN
+        # Output same dimension as input to preserve embedding space for cosine similarity
         self.tnn = TNN(
             in_channels=self.config.embed_dim,
             hidden_channels=self.config.hidden_dim,
-            out_channels=self.config.hidden_dim,
+            out_channels=self.config.embed_dim,  # Preserve dimension for cosine similarity!
             num_layers=self.config.num_tnn_layers,
             model_type=self.config.tnn_type,
             dropout=self.config.dropout,
         )
 
-        # Query encoder
-        self.query_encoder = nn.Sequential(
+        # Query encoder - projects query to same space as TNN output
+        # For training with link predictor
+        # Use a single layer with residual-like initialization to prevent scrambling
+        self.query_encoder = nn.Linear(self.config.embed_dim, self.config.embed_dim)
+        with torch.no_grad():
+            self.query_encoder.weight.copy_(torch.eye(self.config.embed_dim))
+            self.query_encoder.bias.zero_()
+
+        # Gating mechanism: learns to combine GPS (LP-RAG) and TNN (TopoRAG) outputs
+        # gate = sigmoid(W @ x + b) → 0 = pure LP-RAG, 1 = pure TopoRAG
+        self.topo_gate = nn.Sequential(
             nn.Linear(self.config.embed_dim, self.config.hidden_dim),
             nn.ReLU(),
-            nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
-        )
-
-        # Link predictor (query-cell scoring)
-        self.link_predictor = nn.Sequential(
-            nn.Linear(self.config.hidden_dim * 2, self.config.hidden_dim),
-            nn.ReLU(),
             nn.Linear(self.config.hidden_dim, 1),
+            nn.Sigmoid(),
         )
+        # Initialize last layer bias to a large negative value so gate starts near 0
+        nn.init.constant_(self.topo_gate[-2].bias, -3.0)
+        nn.init.zeros_(self.topo_gate[-2].weight)
+
+        # Learnable branch scales
+        self.topo_scale = nn.Parameter(torch.ones([]))
+        self.base_scale = nn.Parameter(torch.ones([]))
 
         # Storage
         self.chunks: List[str] = []
@@ -216,6 +230,196 @@ class TopoRAG(nn.Module):
 
         return self.lifted
 
+    def augment_with_query(
+        self,
+        query_emb: torch.Tensor,
+        k: int = 5,
+        node_features: Optional[torch.Tensor] = None
+    ) -> LiftedTopology:
+        """
+        Create a new topology with query added as a node.
+        
+        Args:
+            query_emb: (dim,) query embedding
+            k: number of nearest neighbors to connect to
+            node_features: (num_nodes, dim) optional override for node features (e.g. from GPS)
+            
+        Returns:
+            LiftedTopology with N+1 nodes
+        """
+        import torch.nn.functional as F
+        
+        # Use provided features or default to lifted.x_0
+        node_embs = node_features if node_features is not None else self.lifted.x_0
+        
+        if query_emb.dim() == 1:
+            query_emb = query_emb.unsqueeze(0)
+            
+        # Compute cosine similarity
+        # Note: we use detach() for finding neighbors to avoid backprop through k-NN selection
+        # (unless we want differentiable k-NN which is hard)
+        sims = F.cosine_similarity(query_emb.detach(), node_embs.detach())
+        top_k_vals, top_k_indices = torch.topk(sims, min(k, len(node_embs)))
+        neighbors = top_k_indices.tolist()
+        
+        # 2. Create new x_0
+        x_0_new = torch.cat([node_embs, query_emb], dim=0)
+        num_nodes_new = x_0_new.shape[0]
+        query_node_idx = num_nodes_new - 1
+        
+        # 3. Create new incidence_1 (node-hyperedge)
+        B1 = self.lifted.incidence_1
+        num_edges_old = self.lifted.num_edges
+        num_new_hyperedges = len(neighbors)
+        
+        # New hyperedges: For each neighbor, create a hyperedge [neighbor, query]
+        # (This can be extended later to include neighbor's other neighbors)
+        new_rows = []
+        new_cols = []
+        new_vals = []
+        
+        for i, neighbor_idx in enumerate(neighbors):
+            he_idx = num_edges_old + i
+            # Connection to neighbor
+            new_rows.append(neighbor_idx)
+            new_cols.append(he_idx)
+            new_vals.append(1.0)
+            # Connection to query
+            new_rows.append(query_node_idx)
+            new_cols.append(he_idx)
+            new_vals.append(1.0)
+            
+        new_indices = torch.tensor([new_rows, new_cols], device=self.device)
+        new_values = torch.tensor(new_vals, device=self.device)
+        
+        if B1.is_sparse:
+            B1 = B1.coalesce()
+            combined_indices = torch.cat([B1.indices(), new_indices], dim=1)
+            combined_values = torch.cat([B1.values(), new_values])
+            
+            B1_new = torch.sparse_coo_tensor(
+                combined_indices, 
+                combined_values, 
+                size=(num_nodes_new, num_edges_old + num_new_hyperedges)
+            ).coalesce()
+        else:
+            # Dense fallback
+            B1_new = torch.zeros((num_nodes_new, num_edges_old + num_new_hyperedges), device=self.device)
+            B1_new[:self.lifted.num_nodes, :num_edges_old] = B1
+            B1_new[new_rows, new_cols] = 1.0
+            
+        # 4. Create new x_1 (hyperedge features)
+        neighbor_feats = node_embs[top_k_indices]
+        query_feat_expanded = query_emb.expand(len(neighbors), -1)
+        new_edge_feats = (neighbor_feats + query_feat_expanded) / 2
+        
+        if self.lifted.x_1 is not None:
+            x_1_new = torch.cat([self.lifted.x_1, new_edge_feats], dim=0)
+        else:
+            x_1_new = new_edge_feats
+            
+        # 5. Handle incidence_2 (edges -> 2-cells)
+        # Pad with zeros for new edges
+        if self.lifted.incidence_2 is not None:
+            B2 = self.lifted.incidence_2
+            num_2cells = self.lifted.num_2cells
+            
+            if B2.is_sparse:
+                B2 = B2.coalesce()
+                B2_new = torch.sparse_coo_tensor(
+                    B2.indices(),
+                    B2.values(),
+                    size=(num_edges_old + num_new_hyperedges, num_2cells)
+                ).coalesce()
+            else:
+                B2_new = torch.zeros((num_edges_old + num_new_hyperedges, num_2cells), device=self.device)
+                B2_new[:num_edges_old, :] = B2
+        else:
+            B2_new = None
+            
+        return LiftedTopology(
+            x_0=x_0_new,
+            x_1=x_1_new,
+            x_2=self.lifted.x_2,
+            incidence_1=B1_new,
+            incidence_2=B2_new,
+            num_nodes=num_nodes_new,
+            num_edges=num_edges_old + num_new_hyperedges,
+            num_2cells=self.lifted.num_2cells,
+        )
+
+    def retrieve_graph_interaction(
+        self,
+        query_text: str,
+        top_k: int = 5
+    ) -> Dict[str, Any]:
+        """
+        Retrieve using query-as-node graph interaction.
+        """
+        if self.lifted is None:
+            raise RuntimeError("Must build graph first")
+            
+        # 1. Encode query
+        # Use query_encoder to match training (encoder is identity-initialized, safe even if untrained)
+        query_emb = self.encode_query(query_text, use_encoder=True)
+            
+        # 2. Apply GPS to existing chunks (if enabled)
+        if self.config.use_gps and self.graph is not None:
+             x_0 = self.forward_gps(self.lifted.x_0, self.graph.edge_index.to(self.device))
+        else:
+             x_0 = self.lifted.x_0
+
+        # 3. Augment graph
+        # Connect query to closest nodes based on CURRENT embedding state (x_0)
+        augmented_lifted = self.augment_with_query(
+            query_emb.squeeze(0), 
+            k=5, 
+            node_features=x_0
+        )
+        
+        # 4. Run TNN on augmented graph
+        tnn_output = self.tnn.forward_from_lifted(augmented_lifted)
+
+        # 5. Get embeddings from both pathways
+        # TopoRAG: after TNN message passing
+        q_topo = tnn_output.x_0[-1:]  # Query after TNN
+        c_topo = tnn_output.x_0[:-1]  # Chunks after TNN
+
+        # LP-RAG style: GPS only (no TNN)
+        q_gps = query_emb  # Query (no TNN)
+        c_gps = x_0  # Chunks after GPS only
+
+        # 6. Gated combination with RESIDUAL baseline preservation
+        # Use learnable scaling factors to match magnitudes instead of restrictive LayerNorm
+        if not hasattr(self, 'topo_scale'):
+            self.topo_scale = nn.Parameter(torch.ones([]))
+            self.base_scale = nn.Parameter(torch.ones([]))
+            
+        gate = self.topo_gate(q_topo.squeeze(0))
+        
+        # Combine branches with learnable relative scaling
+        query_final = (1 - gate) * self.base_scale * query_emb + gate * self.topo_scale * q_topo
+        candidate_embs = (1 - gate) * self.base_scale * self.lifted.x_0 + gate * self.topo_scale * c_topo
+
+        if self.config.debug:
+            print(f"DEBUG: q_topo mean abs: {q_topo.abs().mean():.6f}, q_gps mean abs: {q_gps.abs().mean():.6f}")
+            print(f"DEBUG: gate value: {gate.item():.4f}")
+            print(f"DEBUG: candidate_embs mean abs: {candidate_embs.abs().mean():.6f}")
+
+        # 7. Score using cosine similarity on refined embeddings
+        # This ensures the TNN is learning to shift the embeddings into a better space
+        scores = self.score_cells(query_final, candidate_embs, use_cosine=True)
+             
+        # 7. Top-k
+        k = min(top_k, len(self.chunks))
+        top_scores, top_indices = torch.topk(scores, k)
+        
+        return {
+            "chunks": top_indices.tolist(),
+            "scores": top_scores.tolist(),
+            "chunk_texts": [self.chunks[i] for i in top_indices.tolist() if i < len(self.chunks)]
+        }
+
     def forward_gps(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         """Run GPS (Graph Transformer) on node features.
 
@@ -266,30 +470,25 @@ class TopoRAG(nn.Module):
         self,
         query_emb: torch.Tensor,
         cell_embeddings: torch.Tensor,
-        use_cosine: bool = False,
+        use_cosine: bool = True,
     ) -> torch.Tensor:
-        """Score query-cell pairs.
-
+        """Score query-cell pairs using normalized dot product.
+        
         Args:
-            query_emb: (1, dim) or (dim,) query embedding
+            query_emb: (1, dim) query embedding
             cell_embeddings: (num_cells, dim) cell embeddings
-            use_cosine: If True, use cosine similarity. If False, use learned link predictor.
+            use_cosine: Ignored, always use cosine for stability.
         """
-        if use_cosine:
-            # Cosine similarity (better for retrieval ranking)
-            query_norm = query_emb / query_emb.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            cell_norm = cell_embeddings / cell_embeddings.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            if query_norm.dim() == 1:
-                query_norm = query_norm.unsqueeze(0)
-            scores = (query_norm @ cell_norm.T).squeeze(0)
-            return scores
-        else:
-            # Learned link predictor (for training)
-            num_cells = cell_embeddings.shape[0]
-            query_expanded = query_emb.expand(num_cells, -1)
-            combined = torch.cat([query_expanded, cell_embeddings], dim=-1)
-            scores = self.link_predictor(combined).squeeze(-1)
-            return scores
+        # Normalize for cosine similarity
+        query_norm = query_emb / query_emb.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        cell_norm = cell_embeddings / cell_embeddings.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        
+        if query_norm.dim() == 1:
+            query_norm = query_norm.unsqueeze(0)
+            
+        # Standard contrastive scale (1/0.05 = 20.0)
+        scores = (query_norm @ cell_norm.T).squeeze(0)
+        return scores * 20.0
 
     def retrieve(
         self,
@@ -317,10 +516,6 @@ class TopoRAG(nn.Module):
             raise RuntimeError("Must call build_from_chunks first")
 
         top_k = top_k or self.config.top_k
-
-        # For cosine similarity retrieval, use raw query embedding (same space as chunks)
-        # The query encoder is only useful when training with BCE loss
-        query_emb = self.encode_query(query_text, use_encoder=False)
 
         # Get node embeddings through GPS + TNN pipeline
         if self.config.use_gps or self.config.use_tnn:
@@ -360,10 +555,22 @@ class TopoRAG(nn.Module):
             # Use raw embeddings
             node_embeddings = self.lifted.x_0
 
+        # Encode query
+        # If GPS/TNN are trained, use query_encoder to map query to same trained space
+        # This ensures consistency between training (BCE loss) and inference
+        if self.config.use_gps or self.config.use_tnn:
+            query_emb = self.encode_query(query_text, use_encoder=True)
+        else:
+            query_emb = self.encode_query(query_text, use_encoder=False)
+
+        if self.config.debug:
+            print(f"DEBUG: node_embs mean abs: {node_embeddings.abs().mean():.6f}")
+            print(f"DEBUG: query_emb mean abs: {query_emb.abs().mean():.6f}")
+
         if retrieve_nodes:
 
-            # Score nodes (chunks) using cosine similarity for better ranking
-            scores = self.score_cells(query_emb, node_embeddings, use_cosine=True)
+            # Score nodes (chunks) using normalized dot product
+            scores = self.score_cells(query_emb, node_embeddings)
 
             # Get top-k chunks directly
             k = min(top_k, len(self.chunks))
@@ -415,7 +622,7 @@ class TopoRAG(nn.Module):
                     "chunk_texts": [],
                 }
 
-            # Score cells
+            # Score cells using normalized dot product
             scores = self.score_cells(query_emb, cell_embeddings)
 
             # Get top-k cells

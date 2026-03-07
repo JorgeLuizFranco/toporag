@@ -278,3 +278,115 @@ def create_evaluation_data(
         })
 
     return eval_data
+
+
+def load_gfm_dataset(
+    data_path: str,
+    dataset_name: str,
+    max_samples: Optional[int] = None,
+) -> Tuple[Dict[str, str], List[Dict[str, Any]]]:
+    """
+    Load dataset in GFM-RAG standard format.
+
+    Returns:
+        corpus: Dict[title, text] - The complete document corpus
+        test_data: List[Dict] - Test samples with 'supporting_facts' (titles)
+    """
+    data_path = Path(data_path)
+    
+    # Check for GFM-RAG 'raw' structure (dataset_corpus.json + test.json)
+    # Expected: data_path/raw/dataset_corpus.json
+    raw_path = data_path / "raw"
+    if (raw_path / "dataset_corpus.json").exists():
+        print(f"Loading GFM-RAG format from {raw_path}...")
+        
+        # Load Corpus
+        with open(raw_path / "dataset_corpus.json") as f:
+            corpus = json.load(f)
+            
+        # Load Test Data
+        test_file = raw_path / "test.json"
+        if not test_file.exists():
+             # Fallback to train.json if test doesn't exist (e.g. dev set)
+             test_file = raw_path / "train.json"
+             
+        with open(test_file) as f:
+            test_data = json.load(f)
+            
+        if max_samples:
+            test_data = test_data[:max_samples]
+            
+        return corpus, test_data
+
+    # Fallback: Load from monolithic JSON (LPGNN format) and convert
+    print(f"Loading monolithic format from {data_path} and converting...")
+    
+    # Handle different filenames for different datasets
+    filename = f"{dataset_name}.json"
+    if dataset_name == "2wiki":
+        filename = "2wikimultihopqa.json"
+        
+    monolithic_path = data_path / filename
+    if not monolithic_path.exists():
+        # Try finding any .json file
+        json_files = list(data_path.glob("*.json"))
+        if json_files:
+            monolithic_path = json_files[0]
+        else:
+            raise FileNotFoundError(f"No data found at {data_path}")
+
+    with open(monolithic_path) as f:
+        data = json.load(f)
+
+    if max_samples:
+        data = data[:max_samples]
+
+    corpus = {}
+    test_data = []
+
+    for item in data:
+        # Extract documents for corpus
+        # Formats vary slightly between datasets
+        paragraphs = item.get("paragraphs", [])
+        if not paragraphs and "context" in item:
+            # HotpotQA/2Wiki format: context is [[title, [sentences]], ...]
+            paragraphs = []
+            for ctx in item["context"]:
+                paragraphs.append({
+                    "title": ctx[0],
+                    "paragraph_text": "".join(ctx[1])
+                })
+        
+        supporting_titles = []
+        
+        # Build Corpus & Extract Ground Truth
+        for p in paragraphs:
+            title = p.get("title")
+            text = p.get("paragraph_text", "")
+            if not title: 
+                continue
+                
+            # Add to corpus (deduplicated by title)
+            if title not in corpus:
+                corpus[title] = text
+            
+            # Check if supporting (MuSiQue style)
+            if p.get("is_supporting", False):
+                supporting_titles.append(title)
+        
+        # HotpotQA/2Wiki separate supporting_facts list: [[title, sent_id], ...]
+        if "supporting_facts" in item:
+            # Override/Extend with explicit list
+            s_facts = item["supporting_facts"]
+            # s_facts is list of [title, sent_idx]
+            titles = set(f[0] for f in s_facts)
+            supporting_titles = list(titles)
+
+        test_data.append({
+            "id": item.get("_id") or item.get("id"),
+            "question": item["question"],
+            "answer": item.get("answer", ""),
+            "supporting_facts": supporting_titles
+        })
+
+    return corpus, test_data
