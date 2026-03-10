@@ -199,6 +199,92 @@ def build_incidence_tensors(cell_to_nodes, n_chunks, device):
 
 
 # ===========================================================================
+# Synthetic query augmentation
+# ===========================================================================
+
+def generate_synthetic_samples(cell_to_nodes, x_chunks_cpu, embedder, n_synth=300,
+                               n_supporting=2, seed=42):
+    """Generate synthetic training samples that mimic gold label distribution.
+
+    Strategy: pick 2-3 chunks from different cells that share an entity neighbor,
+    concatenate their text embeddings as a pseudo-query, and mark them as supporting.
+    This teaches the model the same graph-propagation pattern as gold labels.
+
+    The synthetic query embedding = mean of supporting chunk embeddings (like a
+    centroid query that points at the answer chunks).
+    """
+    rng = random.Random(seed)
+    N = x_chunks_cpu.shape[0]
+
+    # Build node -> cells mapping
+    node_to_cells = defaultdict(list)
+    for cid, nodes in cell_to_nodes.items():
+        for n in nodes:
+            node_to_cells[n].append(cid)
+
+    # Build cell adjacency: cells that share at least one node
+    cell_neighbors = defaultdict(set)
+    for n, cells in node_to_cells.items():
+        for i, c1 in enumerate(cells):
+            for c2 in cells[i+1:]:
+                cell_neighbors[c1].add(c2)
+                cell_neighbors[c2].add(c1)
+
+    cell_ids = list(cell_to_nodes.keys())
+    synth_samples = []
+    synth_embeddings = []
+
+    attempts = 0
+    while len(synth_samples) < n_synth and attempts < n_synth * 10:
+        attempts += 1
+        # Pick a random cell
+        c1 = rng.choice(cell_ids)
+        nodes1 = cell_to_nodes[c1]
+        if len(nodes1) < 1:
+            continue
+
+        # Pick a neighboring cell (simulates multi-hop)
+        neighbors = list(cell_neighbors.get(c1, set()))
+        if not neighbors:
+            continue
+        c2 = rng.choice(neighbors)
+        nodes2 = cell_to_nodes[c2]
+        if len(nodes2) < 1:
+            continue
+
+        # Pick one chunk from each cell as "supporting"
+        s1 = rng.choice(nodes1)
+        s2 = rng.choice(nodes2)
+        if s1 == s2:
+            continue
+
+        supporting = [s1, s2]
+
+        # Optionally add a 3rd supporting chunk (30% of the time, like gold avg ~2.6)
+        if rng.random() < 0.3 and neighbors:
+            c3 = rng.choice(neighbors)
+            nodes3 = cell_to_nodes[c3]
+            if nodes3:
+                s3 = rng.choice(nodes3)
+                if s3 not in supporting:
+                    supporting.append(s3)
+
+        # Synthetic query = mean of supporting chunk embeddings
+        supp_embs = x_chunks_cpu[supporting]  # (k, D)
+        q_emb = supp_embs.mean(dim=0)  # (D,)
+
+        synth_samples.append({"question": f"[synth_{len(synth_samples)}]", "supporting": supporting})
+        synth_embeddings.append(q_emb)
+
+    if synth_embeddings:
+        synth_q_embs = torch.stack(synth_embeddings)
+    else:
+        synth_q_embs = torch.empty(0, x_chunks_cpu.shape[1])
+
+    return synth_samples, synth_q_embs
+
+
+# ===========================================================================
 # Pre-computation
 # ===========================================================================
 
@@ -393,6 +479,8 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--temperature", type=float, default=0.05)
+    parser.add_argument("--n_synth", type=int, default=300,
+                        help="Number of synthetic augmentation samples (0=none)")
     parser.add_argument("--quick", action="store_true",
                         help="Quick test: 1 fold, 10 epochs")
     args = parser.parse_args()
@@ -472,8 +560,26 @@ def main():
     q_embs = embed_questions(all_samples, embedder)
     print(f"  q_embs: {q_embs.shape}")
 
-    # --- CV folds ---
-    all_indices = list(range(Q))
+    # --- Synthetic augmentation ---
+    n_real = Q  # number of real (gold) samples
+    synth_indices = []
+    if args.n_synth > 0:
+        print(f"\n[Generating {args.n_synth} synthetic training samples]")
+        synth_samples, synth_q_embs = generate_synthetic_samples(
+            cell_to_nodes_all, x_chunks_cpu, embedder,
+            n_synth=args.n_synth, seed=args.seed)
+        print(f"  Generated {len(synth_samples)} synthetic samples "
+              f"(avg {np.mean([len(s['supporting']) for s in synth_samples]):.1f} supporting/sample)")
+        # Append synthetic to all_samples and q_embs
+        synth_start = len(all_samples)
+        all_samples.extend(synth_samples)
+        q_embs = torch.cat([q_embs, synth_q_embs], dim=0)
+        synth_indices = list(range(synth_start, len(all_samples)))
+        Q_total = len(all_samples)
+        print(f"  Total with synth: {Q_total} ({n_real} real + {len(synth_indices)} synth)")
+
+    # --- CV folds (only real samples in test, synth always in train) ---
+    all_indices = list(range(n_real))  # only real samples for fold splitting
     rng = random.Random(args.seed)
     rng.shuffle(all_indices)
 
@@ -494,7 +600,8 @@ def main():
     run_config = {
         "datasets": args.datasets,
         "max_samples": args.max_samples,
-        "n_chunks": N, "n_cells": M, "n_questions": Q,
+        "n_chunks": N, "n_cells": M, "n_questions": n_real,
+        "n_synth": len(synth_indices),
         "n_folds": n_folds, "epochs": args.epochs,
         "patience": args.patience, "batch_size": args.batch_size,
         "hard_neg_k": args.hard_neg_k,
@@ -537,9 +644,11 @@ def main():
     for fi in range(n_folds):
         test_idx = folds[fi]
         train_idx = [i for i in all_indices if i not in set(test_idx)]
+        # Add ALL synthetic samples to training (they're never in test)
+        train_idx = train_idx + synth_indices
 
         print(f"\n{'='*70}")
-        print(f"Fold {fi+1}/{n_folds}: {len(train_idx)} train, {len(test_idx)} test")
+        print(f"Fold {fi+1}/{n_folds}: {len(train_idx)} train ({len(train_idx)-len(synth_indices)} real + {len(synth_indices)} synth), {len(test_idx)} test")
         print(f"{'='*70}")
 
         model = create_model(embed_dim, args.hidden_dim, args.num_layers,
