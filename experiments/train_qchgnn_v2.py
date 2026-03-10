@@ -555,6 +555,8 @@ def main():
                         help="Bradley-Terry preference post-training epochs (0=skip)")
     parser.add_argument("--quick", action="store_true",
                         help="Quick test: 1 fold, 10 epochs")
+    parser.add_argument("--no_cv", action="store_true",
+                        help="No cross-validation: train and eval on ALL data")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -655,7 +657,11 @@ def main():
     rng = random.Random(args.seed)
     rng.shuffle(all_indices)
 
-    if args.quick:
+    if args.no_cv:
+        n_folds = 1
+        folds = [all_indices]  # test on ALL data
+        print("\n[NO-CV MODE: train and eval on ALL data]")
+    elif args.quick:
         n_folds = 1
         folds = [all_indices[:Q//5]]
         print("\n[QUICK MODE: 1 fold, testing on first 20%]")
