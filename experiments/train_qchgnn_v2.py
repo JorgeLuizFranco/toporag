@@ -388,7 +388,12 @@ def main():
     print(f"Results: {run_dir}")
     print("=" * 70)
 
+    # Try multiple data directory locations
     data_dir = PROJECT_ROOT / "LPGNN-retriever/datasets"
+    if not data_dir.exists():
+        data_dir = REPO_ROOT / "datasets"  # cluster layout
+    if not data_dir.exists():
+        data_dir = PROJECT_ROOT / "datasets"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
