@@ -427,6 +427,76 @@ def evaluate(model, x_chunks, q_embs, samples, test_idx, device,
 
 
 # ===========================================================================
+# Preference Learning (Bradley-Terry post-training)
+# ===========================================================================
+
+def preference_train_one_epoch(model, x_chunks, q_embs, samples, train_idx,
+                                optimizer, device, flat_nodes_t, cell_asgn_t,
+                                M, degrees_v, degrees_e, n_pairs=10):
+    """Bradley-Terry preference post-training.
+
+    After initial training, freeze the backbone (query_proj, node_proj, layers)
+    and fine-tune only the score_mlp head using pairwise preference loss.
+
+    For each query:
+      - Preferred: gold chunks that the model ranked LOW (hard positives)
+      - Dispreferred: non-gold chunks that the model ranked HIGH (hard negatives)
+
+    Loss: -log(sigmoid(score(preferred) - score(dispreferred)))
+    """
+    model.train()
+    n = x_chunks.shape[0]
+    indices = list(train_idx)
+    random.shuffle(indices)
+
+    total_loss, n_steps = 0.0, 0
+
+    for qi in indices:
+        gt = samples[qi]["supporting"]
+        if not gt:
+            continue
+        gt_set = set(g for g in gt if g < n)
+        if not gt_set:
+            continue
+
+        q = q_embs[qi:qi+1].to(device)
+
+        # Forward pass
+        scores = model(x_chunks, q, flat_nodes_t, cell_asgn_t,
+                       M, degrees_v, degrees_e).squeeze(0)  # (N,)
+
+        # Gold chunks scored by model
+        gold_idx = list(gt_set)
+        gold_scores = scores[gold_idx]  # (n_gold,)
+
+        # Hard negatives: top scoring non-gold chunks
+        neg_mask = torch.ones(n, dtype=torch.bool, device=device)
+        for gi in gold_idx:
+            neg_mask[gi] = False
+        neg_scores_all = scores.clone()
+        neg_scores_all[~neg_mask] = float('-inf')
+        k_neg = min(n_pairs, neg_mask.sum().item())
+        _, hard_neg_idx = neg_scores_all.topk(k_neg)
+        hard_neg_scores = scores[hard_neg_idx]  # (k_neg,)
+
+        # Bradley-Terry: all (gold, hard_neg) pairs
+        # gold_scores: (n_gold,), hard_neg_scores: (k_neg,)
+        # Expand to (n_gold, k_neg) pairwise differences
+        diff = gold_scores.unsqueeze(1) - hard_neg_scores.unsqueeze(0)  # (n_gold, k_neg)
+        bt_loss = -F.logsigmoid(diff).mean()
+
+        optimizer.zero_grad()
+        bt_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        total_loss += bt_loss.item()
+        n_steps += 1
+
+    return total_loss / max(n_steps, 1)
+
+
+# ===========================================================================
 # Model with zero-init fix
 # ===========================================================================
 
@@ -481,6 +551,8 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.05)
     parser.add_argument("--n_synth", type=int, default=300,
                         help="Number of synthetic augmentation samples (0=none)")
+    parser.add_argument("--bt_epochs", type=int, default=20,
+                        help="Bradley-Terry preference post-training epochs (0=skip)")
     parser.add_argument("--quick", action="store_true",
                         help="Quick test: 1 fold, 10 epochs")
     args = parser.parse_args()
@@ -704,6 +776,58 @@ def main():
             if patience_counter >= args.patience:
                 print(f"  Early stopping at epoch {epoch+1}")
                 break
+
+        # --- Bradley-Terry Preference Post-Training ---
+        if best_state and args.bt_epochs > 0:
+            print(f"\n  [Preference post-training: {args.bt_epochs} epochs]")
+            # Load best model
+            model_bt = create_model(embed_dim, args.hidden_dim, args.num_layers,
+                                     args.init_k, args.dropout, device)
+            model_bt.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+
+            # Freeze backbone, only train score_mlp and mp_gate
+            for name, p in model_bt.named_parameters():
+                if 'score_mlp' not in name and 'mp_gate' not in name:
+                    p.requires_grad = False
+
+            bt_params = [p for p in model_bt.parameters() if p.requires_grad]
+            n_bt_params = sum(p.numel() for p in bt_params)
+            print(f"  BT trainable params: {n_bt_params:,} (score_mlp + gate)")
+
+            bt_optimizer = torch.optim.AdamW(bt_params, lr=args.lr * 0.1, weight_decay=0.01)
+
+            # Only use REAL train samples for preference (not synthetic)
+            real_train_idx = [i for i in train_idx if i not in set(synth_indices)]
+
+            best_bt_r5 = best_r5
+            bt_log = []
+
+            print(f"  {'Ep':>3}  {'bt_loss':>8}  {'R@2':>6}  {'R@5':>6}  {'R@10':>7}  {'R@20':>7}  {'gate':>5}")
+
+            for bt_ep in range(args.bt_epochs):
+                bt_loss = preference_train_one_epoch(
+                    model_bt, x_chunks, q_embs, all_samples, real_train_idx,
+                    bt_optimizer, device, flat_nodes_t, cell_asgn_t,
+                    M, degrees_v, degrees_e, n_pairs=20)
+
+                m_bt = evaluate(model_bt, x_chunks, q_embs, all_samples, test_idx,
+                                device, flat_nodes_t, cell_asgn_t, M, degrees_v, degrees_e)
+
+                gate = torch.sigmoid(model_bt.mp_gate).item()
+                bt_log.append({"epoch": bt_ep + 1, "bt_loss": bt_loss, "gate": gate, **m_bt})
+
+                improved_bt = ""
+                if m_bt["R@5"] > best_bt_r5:
+                    best_bt_r5 = m_bt["R@5"]
+                    best_state = {k: v.cpu().clone() for k, v in model_bt.state_dict().items()}
+                    improved_bt = " *"
+
+                print(f"  {bt_ep+1:>3}  {bt_loss:>8.4f}  {m_bt['R@2']*100:>5.1f}%  {m_bt['R@5']*100:>5.1f}%  "
+                      f"{m_bt['R@10']*100:>6.1f}%  {m_bt['R@20']*100:>6.1f}%  {gate:>5.3f}{improved_bt}")
+
+            print(f"  BT result: R@5 {best_r5*100:.1f}% → {best_bt_r5*100:.1f}%")
+            best_r5 = best_bt_r5
+            del model_bt, bt_optimizer
 
         fold_result = {
             "fold": fi,
