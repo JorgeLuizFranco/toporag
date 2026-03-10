@@ -124,34 +124,53 @@ def _load_hotpot_2wiki(data):
 # Topology building
 # ===========================================================================
 
+def get_embedder():
+    """Create sentence-transformers embedder independently of toporag module."""
+    try:
+        from toporag import TopoRAG, TopoRAGConfig
+        config = TopoRAGConfig(lifting="entity", use_gps=False, use_tnn=False)
+        toporag = TopoRAG(config)
+        return toporag.embedder, config.embed_dim
+    except ImportError:
+        # Cluster fallback: create embedder directly
+        from sentence_transformers import SentenceTransformer
+        class SimpleEmbedder:
+            def __init__(self):
+                self.model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+                self.embed_dim = 768
+            def encode(self, texts, is_query=False, show_progress=False):
+                return torch.tensor(self.model.encode(texts, show_progress_bar=show_progress))
+        emb = SimpleEmbedder()
+        return emb, emb.embed_dim
+
+
 def build_or_load_topology(chunks, dataset_name, max_samples, device):
     """Build entity lifting topology, with caching."""
-    from toporag import TopoRAG, TopoRAGConfig
-
     cache_dir = REPO_ROOT / "experiments" / "cache" / "topology"
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"{dataset_name}_{max_samples}_entity.pt"
 
-    config = TopoRAGConfig(lifting="entity", use_gps=False, use_tnn=False)
-    toporag = TopoRAG(config)
-    embedder = toporag.embedder
-
     if cache_file.exists():
         print(f"  Loading cached topology: {cache_file}")
-        cache = torch.load(cache_file, weights_only=False)
+        cache = torch.load(cache_file, weights_only=False, map_location="cpu")
         cell_to_nodes = cache["cell_to_nodes"]
         x_chunks = cache["lifted"].x_0
+        embedder, embed_dim = get_embedder()
     else:
+        from toporag import TopoRAG, TopoRAGConfig
+        config = TopoRAGConfig(lifting="entity", use_gps=False, use_tnn=False)
+        toporag = TopoRAG(config)
+        embedder = toporag.embedder
+        embed_dim = config.embed_dim
         print(f"  Building topology for {dataset_name} ({len(chunks)} chunks)...")
-        # We need chunk_to_doc for building the graph
-        chunk_to_doc = list(range(len(chunks)))  # each chunk is its own doc
+        chunk_to_doc = list(range(len(chunks)))
         lifted = toporag.build_from_chunks(chunks, chunk_to_doc)
         cell_to_nodes = dict(lifted.cell_to_nodes)
         x_chunks = lifted.x_0.cpu()
         print(f"  Saving topology cache: {cache_file}")
         torch.save({"lifted": lifted.cpu(), "cell_to_nodes": cell_to_nodes}, cache_file)
 
-    return cell_to_nodes, x_chunks, embedder, config.embed_dim
+    return cell_to_nodes, x_chunks, embedder, embed_dim
 
 
 def build_incidence_tensors(cell_to_nodes, n_chunks, device):
@@ -327,7 +346,10 @@ def evaluate(model, x_chunks, q_embs, samples, test_idx, device,
 
 def create_model(embed_dim, hidden_dim, num_layers, init_k, dropout, device):
     """Create QCHGNN with zero-initialized score_mlp last layer."""
-    from toporag.models.qc_hgnn import QueryConditionedHGNN
+    try:
+        from toporag.models.qc_hgnn import QueryConditionedHGNN
+    except ImportError:
+        from models.qc_hgnn import QueryConditionedHGNN
 
     model = QueryConditionedHGNN(
         embed_dim=embed_dim,
@@ -504,7 +526,10 @@ def main():
           f"R@10={m_init['R@10']*100:.1f}%  R@20={m_init['R@20']*100:.1f}%")
     del dummy_model
 
-    from toporag.models.qc_hgnn import QCHGNNLoss
+    try:
+        from toporag.models.qc_hgnn import QCHGNNLoss
+    except ImportError:
+        from models.qc_hgnn import QCHGNNLoss
 
     # --- Training ---
     fold_results = []
