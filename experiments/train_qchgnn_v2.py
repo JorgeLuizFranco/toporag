@@ -721,7 +721,10 @@ def main():
 
     for fi in range(n_folds):
         test_idx = folds[fi]
-        train_idx = [i for i in all_indices if i not in set(test_idx)]
+        if args.no_cv:
+            train_idx = list(all_indices)  # train on everything
+        else:
+            train_idx = [i for i in all_indices if i not in set(test_idx)]
         # Add ALL synthetic samples to training (they're never in test)
         train_idx = train_idx + synth_indices
 
