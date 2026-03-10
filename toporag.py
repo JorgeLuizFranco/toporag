@@ -29,7 +29,7 @@ from typing import List, Dict, Optional, Tuple, Any
 from torch_geometric.data import Data
 
 from .graph.chunk_graph import ChunkGraphBuilder, ChunkGraphConfig, add_query_nodes_to_graph
-from .lifting import CycleLifting, CliqueLifting, KNNHypergraphLifting, LiftedTopology
+from .lifting import CycleLifting, CliqueLifting, KNNHypergraphLifting, EntityHypergraphLifting, LiftedTopology
 from .models.tnn import TNN, TNNOutput
 from .models.gps import GPS
 from .utils.embedding import TextEmbeddingModel
@@ -127,6 +127,12 @@ class TopoRAG(nn.Module):
             self.lifting = KNNHypergraphLifting(
                 k=self.config.knn_k,
             )
+        elif self.config.lifting == "entity":
+            self.lifting = EntityHypergraphLifting(
+                resolve_aliases=True,
+                normalize_demonyms=True,
+                subdivide_large=True,
+            )
         else:
             raise ValueError(f"Unknown lifting: {self.config.lifting}")
 
@@ -219,7 +225,10 @@ class TopoRAG(nn.Module):
         print(f"  Graph has {self.graph.edge_index.shape[1]} edges")
 
         print(f"Applying {self.config.lifting} lifting...")
-        self.lifted = self.lifting.lift(self.graph)
+        if self.config.lifting == "entity":
+            self.lifted = self.lifting.lift(self.graph, chunks=chunks)
+        else:
+            self.lifted = self.lifting.lift(self.graph)
 
         print(f"  Nodes: {self.lifted.num_nodes}")
         print(f"  Edges: {self.lifted.num_edges}")

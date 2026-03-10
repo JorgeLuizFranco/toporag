@@ -11,8 +11,10 @@ from .base import BaseLiftingTransform, LiftedTopology, Cell
 from .cycle import CycleLifting
 from .clique import CliqueLifting
 from .knn import KNNHypergraphLifting
+from .entity import EntityHypergraphLifting
 
 KNNLifting = KNNHypergraphLifting
+EntityLifting = EntityHypergraphLifting
 
 __all__ = [
     "BaseLiftingTransform",
@@ -22,4 +24,6 @@ __all__ = [
     "CliqueLifting",
     "KNNHypergraphLifting",
     "KNNLifting",
+    "EntityHypergraphLifting",
+    "EntityLifting",
 ]

@@ -158,6 +158,10 @@ class LiftedTopology:
             cell_to_nodes=self.cell_to_nodes,
         )
 
+    def cpu(self) -> 'LiftedTopology':
+        """Move all tensors to CPU."""
+        return self.to('cpu')
+
     def compute_laplacians(self):
         """Compute Hodge Laplacians from incidence matrices."""
         # L_0 = B_1 @ B_1^T (up Laplacian at nodes)

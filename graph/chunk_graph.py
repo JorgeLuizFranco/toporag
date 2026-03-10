@@ -59,48 +59,84 @@ class ChunkGraphBuilder:
             - edge_index: graph edges
             - edge_attr: edge weights (similarity scores)
         """
-        # Move to CPU for graph construction
-        chunk_embeddings = chunk_embeddings.cpu()
+        # Use GPU for similarity computation, with batching for large graphs
+        device = chunk_embeddings.device if chunk_embeddings.is_cuda else (
+            torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+        )
         num_chunks = chunk_embeddings.shape[0]
-        chunk_to_doc = torch.tensor(chunk_to_doc)
+        chunk_to_doc_t = torch.tensor(chunk_to_doc, device=device)
 
         # Normalize embeddings for cosine similarity
-        embeddings_norm = torch.nn.functional.normalize(chunk_embeddings, p=2, dim=-1)
+        embeddings_norm = torch.nn.functional.normalize(
+            chunk_embeddings.to(device), p=2, dim=-1
+        )
 
-        # Compute pairwise similarities
-        similarities = torch.mm(embeddings_norm, embeddings_norm.T)
-
-        # Create masks for intra/inter document
-        doc_matrix = chunk_to_doc.unsqueeze(0) == chunk_to_doc.unsqueeze(1)
-        intra_doc_mask = doc_matrix.float()
-        inter_doc_mask = 1.0 - intra_doc_mask
-
-        # Remove self-connections from intra-doc
-        intra_doc_mask.fill_diagonal_(0)
-
-        # Apply masks to similarities
-        intra_scores = similarities * intra_doc_mask
-        inter_scores = similarities * inter_doc_mask
-
-        # Get top-k for intra-document
         intra_k = min(self.config.intra_doc_k, num_chunks - 1)
-        if intra_k > 0:
-            intra_topk_values, intra_topk_indices = torch.topk(
-                intra_scores, k=intra_k, dim=-1
-            )
+        inter_k = min(self.config.inter_doc_k, num_chunks - 1)
+
+        # Batch size for row-wise processing (avoid OOM on large graphs)
+        # Each batch needs: batch_size × num_chunks floats for similarity + masks
+        mem_per_row = num_chunks * 4 * 3  # 3 tensors (sim, intra, inter) × float32
+        try:
+            free_mem = torch.cuda.mem_get_info(device)[0] if device.type == 'cuda' else 4e9
+        except Exception:
+            free_mem = 4e9
+        batch_size = max(64, int(free_mem * 0.5 / mem_per_row))
+        batch_size = min(batch_size, num_chunks)
+
+        # Collect top-k results per row batch
+        all_intra_vals, all_intra_idx = [], []
+        all_inter_vals, all_inter_idx = [], []
+
+        for start in range(0, num_chunks, batch_size):
+            end = min(start + batch_size, num_chunks)
+            # Similarity for this batch of rows against all columns
+            sim_batch = torch.mm(embeddings_norm[start:end], embeddings_norm.T)  # (bs, n)
+
+            # Document masks for this batch
+            doc_batch = chunk_to_doc_t[start:end].unsqueeze(1) == chunk_to_doc_t.unsqueeze(0)  # (bs, n)
+            intra_mask = doc_batch.float()
+            inter_mask = 1.0 - intra_mask
+
+            # Remove self-loops from intra
+            diag_indices = torch.arange(end - start, device=device)
+            offsets = torch.arange(start, end, device=device)
+            intra_mask[diag_indices, offsets] = 0
+
+            # Intra-doc top-k
+            if intra_k > 0:
+                intra_scores = sim_batch * intra_mask
+                iv, ii = torch.topk(intra_scores, k=min(intra_k, intra_scores.shape[1]), dim=-1)
+                all_intra_vals.append(iv.cpu())
+                all_intra_idx.append(ii.cpu())
+
+            # Inter-doc top-k
+            if inter_k > 0:
+                inter_scores = sim_batch * inter_mask
+                ev, ei = torch.topk(inter_scores, k=min(inter_k, inter_scores.shape[1]), dim=-1)
+                all_inter_vals.append(ev.cpu())
+                all_inter_idx.append(ei.cpu())
+
+            del sim_batch, intra_mask, inter_mask
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+
+        # Concatenate batch results
+        if intra_k > 0 and all_intra_vals:
+            intra_topk_values = torch.cat(all_intra_vals, dim=0)
+            intra_topk_indices = torch.cat(all_intra_idx, dim=0)
         else:
             intra_topk_values = torch.empty(num_chunks, 0)
             intra_topk_indices = torch.empty(num_chunks, 0, dtype=torch.long)
 
-        # Get top-k for inter-document
-        inter_k = min(self.config.inter_doc_k, num_chunks - 1)
-        if inter_k > 0:
-            inter_topk_values, inter_topk_indices = torch.topk(
-                inter_scores, k=inter_k, dim=-1
-            )
+        if inter_k > 0 and all_inter_vals:
+            inter_topk_values = torch.cat(all_inter_vals, dim=0)
+            inter_topk_indices = torch.cat(all_inter_idx, dim=0)
         else:
             inter_topk_values = torch.empty(num_chunks, 0)
             inter_topk_indices = torch.empty(num_chunks, 0, dtype=torch.long)
+
+        chunk_embeddings = chunk_embeddings.cpu()
 
         # Build edge list
         edges = []
